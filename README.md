@@ -95,7 +95,7 @@ ocular.stop_tracing()
 >   - **Event Processing:** ~220ns per PEP 669 event transition (FFI + TSC read + queue push).
 >   - **Full Tracing Overhead (threshold=0):** ~300% - 700% depending on instruction density, blocking Python's internal quickening.
 >   - **Adaptive Overhead (threshold=500):** Near 0% (or mildly negative due to cache warming behaviors), as Ocular dynamically unhooks and allows CPython to fully optimize the hot loops.
->   - **See more at:** [v0.1.0 Benchmarks](docs/benchmarks/BENCHMARKS.md)
+>   - **See more at:** [v0.1.0 Benchmarks](docs/benchmarks.md)
 
 -----
 
