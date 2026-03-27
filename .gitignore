@@ -1,0 +1,8 @@
+target/
+__pycache__/
+bak/
+
+*.txt
+*.json
+*.so
+PLAN.md
