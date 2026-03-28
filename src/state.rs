@@ -2,7 +2,7 @@
 use crate::model::TraceEvent;
 use crossbeam_queue::ArrayQueue;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Mutex, OnceLock, RwLock};
 use std::thread;
 use std::time::Instant;
 
@@ -20,6 +20,22 @@ pub static DEINSTRUMENT_THRESHOLD: AtomicU32 = AtomicU32::new(500);
 
 pub static IS_PERFETTO_ENABLED: AtomicBool = AtomicBool::new(false);
 
+pub struct PatternSet {
+    pub include: Vec<String>,
+    pub exclude: Vec<String>,
+}
+
+impl Default for PatternSet {
+    fn default() -> Self {
+        Self {
+            include: Vec::new(),
+            exclude: Vec::new(),
+        }
+    }
+}
+
+pub static FILTER_PATTERNS: OnceLock<RwLock<PatternSet>> = OnceLock::new();
+
 #[allow(dead_code)]
 pub fn is_perfetto_enabled() -> bool {
     IS_PERFETTO_ENABLED.load(Ordering::Relaxed)
@@ -27,6 +43,63 @@ pub fn is_perfetto_enabled() -> bool {
 
 pub fn set_perfetto_enabled(enabled: bool) {
     IS_PERFETTO_ENABLED.store(enabled, Ordering::Relaxed);
+}
+
+pub fn set_exclude_patterns(patterns: Vec<String>) {
+    let rw = FILTER_PATTERNS.get_or_init(|| RwLock::new(PatternSet::default()));
+    if let Ok(mut guard) = rw.write() {
+        guard.exclude = patterns;
+    }
+}
+
+pub fn get_exclude_patterns() -> Vec<String> {
+    if let Some(rw) = FILTER_PATTERNS.get() {
+        if let Ok(guard) = rw.read() {
+            return guard.exclude.clone();
+        }
+    }
+    Vec::new()
+}
+
+pub fn clear_exclude_patterns() {
+    if let Some(rw) = FILTER_PATTERNS.get() {
+        if let Ok(mut guard) = rw.write() {
+            guard.exclude.clear();
+        }
+    }
+}
+
+pub fn set_include_patterns(patterns: Vec<String>) {
+    let rw = FILTER_PATTERNS.get_or_init(|| RwLock::new(PatternSet::default()));
+    if let Ok(mut guard) = rw.write() {
+        guard.include = patterns;
+    }
+}
+
+pub fn get_include_patterns() -> Vec<String> {
+    if let Some(rw) = FILTER_PATTERNS.get() {
+        if let Ok(guard) = rw.read() {
+            return guard.include.clone();
+        }
+    }
+    Vec::new()
+}
+
+pub fn clear_include_patterns() {
+    if let Some(rw) = FILTER_PATTERNS.get() {
+        if let Ok(mut guard) = rw.write() {
+            guard.include.clear();
+        }
+    }
+}
+
+pub fn with_pattern_set<R>(f: impl FnOnce(&PatternSet) -> R) -> Option<R> {
+    if let Some(rw) = FILTER_PATTERNS.get() {
+        if let Ok(guard) = rw.read() {
+            return Some(f(&*guard));
+        }
+    }
+    None
 }
 
 /// Reads the hardware Time Stamp Counter (TSC) for ultra-low-overhead cycle timing.
@@ -64,6 +137,27 @@ mod tests {
         assert_eq!(is_perfetto_enabled(), true);
         set_perfetto_enabled(false);
         assert_eq!(is_perfetto_enabled(), false);
+    }
+
+    #[test]
+    fn exclude_patterns_can_be_set_and_cleared() {
+        set_exclude_patterns(vec!["/usr".to_string(), "_unpack_opargs".to_string()]);
+        let patterns = get_exclude_patterns();
+        assert!(patterns.contains(&"/usr".to_string()));
+        assert!(patterns.contains(&"_unpack_opargs".to_string()));
+
+        clear_exclude_patterns();
+        assert!(get_exclude_patterns().is_empty());
+    }
+
+    #[test]
+    fn include_patterns_can_be_set_and_cleared() {
+        set_include_patterns(vec!["tests/test3.py".to_string()]);
+        let patterns = get_include_patterns();
+        assert!(patterns.contains(&"tests/test3.py".to_string()));
+
+        clear_include_patterns();
+        assert!(get_include_patterns().is_empty());
     }
 }
 

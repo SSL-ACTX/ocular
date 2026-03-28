@@ -26,7 +26,7 @@ def heavy_computation(n):
 
 def run_one_cycle(enable_tracing: bool, threshold: int = 500) -> tuple[float, int]:
     if enable_tracing:
-        ocular.start_tracing(mode="adaptive", deinstrument_threshold=threshold)
+        ocular.start_tracing(mode="adaptive", deinstrument_threshold=threshold, exclude=["dis", "/usr", "<frozen", "_unpack_opargs"], include_only=["tests/test2.py"])
 
     # warmup
     _ = heavy_computation(1000)

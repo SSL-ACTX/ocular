@@ -1,6 +1,6 @@
 // telemetry.rs
 use crate::model::{CodeMeta, PerfettoEvent, TraceEvent, TraceStats};
-use crate::state::{EVENT_QUEUE, FREE_QUEUE, IS_PRECISE, IS_RUNNING, DEINSTRUMENT_THRESHOLD, is_perfetto_enabled};
+use crate::state::{EVENT_QUEUE, FREE_QUEUE, IS_PRECISE, IS_RUNNING, DEINSTRUMENT_THRESHOLD, is_perfetto_enabled, get_exclude_patterns, get_include_patterns};
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
 
@@ -141,6 +141,7 @@ pub fn telemetry_worker() {
                             }
                         }
 
+
                         call_stack.push((code_ptr, lasti, tsc));
 
                         if is_perfetto_enabled() {
@@ -150,7 +151,7 @@ pub fn telemetry_worker() {
                                 .unwrap_or_else(|| "unknown".to_string());
 
                             let mut event_args = HashMap::new();
-                            event_args.insert("code_ptr".to_string(), format!("0x{:x}", code_ptr));
+                            event_args.insert("code_ptr".to_string(), format!("{}", code_ptr));
                             perfetto_events.push(PerfettoEvent {
                                 name,
                                 cat: "function".to_string(),
@@ -258,7 +259,7 @@ pub fn telemetry_worker() {
                                         );
                                         args.insert(
                                             "code_ptr".to_string(),
-                                            format!("0x{:x}", code_ptr),
+                                            code_ptr.to_string(),
                                         );
 
                                         perfetto_events.push(PerfettoEvent {
@@ -310,7 +311,7 @@ pub fn telemetry_worker() {
                                 .unwrap_or_else(|| "unknown".to_string());
 
                             let mut event_args = HashMap::new();
-                            event_args.insert("code_ptr".to_string(), format!("0x{:x}", code_ptr));
+                            event_args.insert("code_ptr".to_string(), code_ptr.to_string());
                             perfetto_events.push(PerfettoEvent {
                                 name,
                                 cat: "function".to_string(),
@@ -362,12 +363,20 @@ pub fn telemetry_worker() {
     };
     let perfetto_active = is_perfetto_enabled();
     let deinstrument_threshold = DEINSTRUMENT_THRESHOLD.load(Ordering::Relaxed);
+    let exclude_patterns = get_exclude_patterns();
+    let include_patterns = get_include_patterns();
 
     println!("[Ocular] =================================================");
     println!("[Ocular] 🧭 Ocular Telemetry UI");
     println!("[Ocular] mode                 = {}", mode_label);
     println!("[Ocular] perfetto             = {}", perfetto_active);
     println!("[Ocular] deinstrument_threshold = {}", deinstrument_threshold);
+    if !exclude_patterns.is_empty() {
+        println!("[Ocular] exclude patterns      = {:?}", exclude_patterns);
+    }
+    if !include_patterns.is_empty() {
+        println!("[Ocular] include_only patterns = {:?}", include_patterns);
+    }
     println!("[Ocular] active threads       = {:?}", thread::available_parallelism().ok());
     println!("[Ocular] =================================================");
 
@@ -380,7 +389,7 @@ pub fn telemetry_worker() {
                         || meta.filename.contains("<frozen importlib")
                         || meta.filename.contains("<string>");
                     if !is_std {
-                        Some((c_ptr, hits, meta.name.clone(), meta.filename.clone()))
+                        Some((c_ptr, hits, meta.name.as_str(), meta.filename.as_str()))
                     } else {
                         None
                     }

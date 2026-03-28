@@ -16,7 +16,7 @@ start = time.perf_counter()
 hot_loop(5)
 cold_time = time.perf_counter() - start
 
-ocular.start_tracing(mode="adaptive", deinstrument_threshold=500)
+ocular.start_tracing(mode="adaptive", deinstrument_threshold=500, exclude=["dis", "/usr", "<frozen", "_unpack_opargs"], include_only=["tests/test3.py"])
 
 # Run again (should be faster if specialization kicks in)
 start = time.perf_counter()

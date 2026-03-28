@@ -12,7 +12,9 @@ import ocular
 ocular.start_tracing(
     mode="adaptive",          # "adaptive" or "precise"
     perfetto=True,            # Enable/disable Chrome Trace format export
-    deinstrument_threshold=500 # Number of hits before dynamic unhooking
+    deinstrument_threshold=500, # Number of hits before dynamic unhooking
+    exclude=None,             # Optional list of path/pattern filters to ignore
+    include_only=None         # Optional list of path/pattern filters to instrument
 )
 ```
 
@@ -41,7 +43,15 @@ This threshold controls Ocular's dynamic de-instrumentation engine.
     * Ocular will intercept and record every event for the entire duration of the script. 
     * This provides a flawless, gapless timeline but incurs continuous FFI overhead.
 
-### 3. Telemetry Export (`perfetto`)
+### 3. Excluding and Including Code Paths (`exclude`, `include_only`)
+
+* `exclude` lets you skip tracing modules / filenames / function names by substring match.
+  * Example: `exclude=["/usr", "<frozen", "_unpack_opargs"]` will avoid overhead from runtime and internal CPython dispatch logic.
+* `include_only` acts as a whitelist: if set, only matching code paths are traced.
+  * Example: `include_only=["tests/test2.py"]` keeps the instrumentation focus on your benchmark code.
+* Internally, Ocular caches per-`code_ptr` decisions in a zero-allocation thread-local `CodeFilter` table, so this filter decision is cheap and not repeated for every instruction.
+
+### 4. Telemetry Export (`perfetto`)
 
 * When `perfetto=True` is passed, Ocular translates the raw hardware traces into the Chrome Perfetto trace format (`PerfettoEvent` structs). 
 * This data is asynchronously streamed to a lock-free queue and flushed to `ocular_trace.json` by a background worker thread when tracing stops.

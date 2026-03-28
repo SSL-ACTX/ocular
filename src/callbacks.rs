@@ -2,6 +2,7 @@
 use crate::model::TraceEvent;
 use crate::state::{
     get_ts, init_tsc_calibration, is_perfetto_enabled, set_perfetto_enabled,
+    set_exclude_patterns, set_include_patterns, clear_exclude_patterns, clear_include_patterns,
     DEINSTRUMENT_THRESHOLD, EVENT_QUEUE, FREE_QUEUE, IS_PRECISE, IS_RUNNING, WORKER_THREAD,
 };
 use crate::telemetry::telemetry_worker;
@@ -22,6 +23,91 @@ thread_local! {
     static LOCAL_BATCH: RefCell<Vec<TraceEvent>> = RefCell::new(Vec::with_capacity(BATCH_SIZE));
     static SEEN_CODE_PTRS: RefCell<HashSet<usize>> = RefCell::new(HashSet::new());
     static HOT_OFFSETS: RefCell<HashMap<(usize, i32), u32>> = RefCell::new(HashMap::new());
+    static CODE_FILTER: RefCell<CodeFilter> = RefCell::new(CodeFilter::new());
+}
+
+struct CodeFilter {
+    keys: Box<[usize]>,
+    values: Box<[u8]>,
+    mask: usize,
+}
+
+impl CodeFilter {
+    fn new() -> Self {
+        let cap = 1 << 13; // 8192 entries
+        Self {
+            keys: vec![0; cap].into_boxed_slice(),
+            values: vec![0; cap].into_boxed_slice(),
+            mask: cap - 1,
+        }
+    }
+
+    #[inline(always)]
+    fn hash(code_ptr: usize) -> usize {
+        let x = code_ptr.wrapping_mul(11400714819323198485u64 as usize);
+        x ^ (x >> 16)
+    }
+
+    #[inline(always)]
+    fn get(&self, code_ptr: usize) -> Option<bool> {
+        let mut idx = Self::hash(code_ptr) & self.mask;
+        loop {
+            let v = self.values[idx];
+            if v == 0 {
+                return None;
+            }
+            if self.keys[idx] == code_ptr {
+                return Some(v == 2);
+            }
+            idx = (idx + 1) & self.mask;
+        }
+    }
+
+    #[inline(always)]
+    fn insert(&mut self, code_ptr: usize, allowed: bool) {
+        let mut idx = Self::hash(code_ptr) & self.mask;
+        loop {
+            if self.values[idx] == 0 || self.keys[idx] == code_ptr {
+                self.keys[idx] = code_ptr;
+                self.values[idx] = if allowed { 2 } else { 1 };
+                return;
+            }
+            idx = (idx + 1) & self.mask;
+        }
+    }
+}
+
+fn resolve_code_filter(code_ptr: usize, filename: &str, func_name: &str) -> bool {
+    let (include_ok, exclude_blocked) = if let Some(result) = crate::state::with_pattern_set(|pattern_set| {
+        let include_ok = pattern_set.include.is_empty()
+            || pattern_set
+                .include
+                .iter()
+                .any(|pat| filename.contains(pat) || func_name.contains(pat));
+
+        let exclude_blocked = !pattern_set.exclude.is_empty()
+            && pattern_set
+                .exclude
+                .iter()
+                .any(|pat| filename.contains(pat) || func_name.contains(pat));
+
+        (include_ok, exclude_blocked)
+    }) {
+        result
+    } else {
+        (true, false)
+    };
+
+    let allowed = include_ok && !exclude_blocked;
+    CODE_FILTER.with(|filter| {
+        filter.borrow_mut().insert(code_ptr, allowed);
+    });
+
+    allowed
+}
+
+fn code_ptr_allowed(code_ptr: usize) -> Option<bool> {
+    CODE_FILTER.with(|filter| filter.borrow().get(code_ptr))
 }
 
 #[inline(always)]
@@ -52,6 +138,25 @@ pub fn instruction_callback(
     instruction_offset: i32,
 ) -> Py<PyAny> {
     let code_ptr = code.as_ptr() as usize;
+    let trace_allowed = match code_ptr_allowed(code_ptr) {
+        Some(allowed) => allowed,
+        None => {
+            let filename = code
+                .getattr("co_filename")
+                .and_then(|f| f.extract::<String>())
+                .unwrap_or_else(|_| "<unknown>".to_string());
+            let func_name = code
+                .getattr("co_name")
+                .and_then(|n| n.extract::<String>())
+                .unwrap_or_else(|_| "<unknown>".to_string());
+            resolve_code_filter(code_ptr, &filename, &func_name)
+        }
+    };
+
+    if !trace_allowed {
+        return py.None().into();
+    }
+
     enqueue_event(TraceEvent::Instruction {
         code_ptr,
         lasti: instruction_offset,
@@ -84,6 +189,27 @@ pub fn py_start_callback(code: &Bound<'_, PyCode>, instruction_offset: i32) {
     let ts = if is_perfetto_enabled() { get_ts() } else { 0 };
     let code_ptr = code.as_ptr() as usize;
 
+    // Determine whether this code pointer should be traced.
+    let trace_allowed = match code_ptr_allowed(code_ptr) {
+        Some(allowed) => allowed,
+        None => {
+            let filename = code
+                .getattr("co_filename")
+                .and_then(|f| f.extract::<String>())
+                .unwrap_or_else(|_| "<unknown>".to_string());
+            let func_name = code
+                .getattr("co_name")
+                .and_then(|n| n.extract::<String>())
+                .unwrap_or_else(|_| "<unknown>".to_string());
+
+            resolve_code_filter(code_ptr, &filename, &func_name)
+        }
+    };
+
+    if !trace_allowed {
+        return;
+    }
+
     let code_opt = SEEN_CODE_PTRS.with(|seen| {
         if seen.borrow_mut().insert(code_ptr) {
             Some(code.clone().unbind())
@@ -111,6 +237,26 @@ pub fn jump_callback(
 ) -> Py<PyAny> {
     let ts = if is_perfetto_enabled() { get_ts() } else { 0 };
     let code_ptr = code.as_ptr() as usize;
+
+    let trace_allowed = match code_ptr_allowed(code_ptr) {
+        Some(allowed) => allowed,
+        None => {
+            let filename = code
+                .getattr("co_filename")
+                .and_then(|f| f.extract::<String>())
+                .unwrap_or_else(|_| "<unknown>".to_string());
+            let func_name = code
+                .getattr("co_name")
+                .and_then(|n| n.extract::<String>())
+                .unwrap_or_else(|_| "<unknown>".to_string());
+            resolve_code_filter(code_ptr, &filename, &func_name)
+        }
+    };
+
+    if !trace_allowed {
+        return py.None().into();
+    }
+
     enqueue_event(TraceEvent::Jump {
         code_ptr,
         from_lasti: instruction_offset,
@@ -148,21 +294,44 @@ pub fn py_return_callback(
 ) {
     let _ = instruction_offset;
     let _ = retval;
+    let code_ptr = code.as_ptr() as usize;
+
+    let trace_allowed = match code_ptr_allowed(code_ptr) {
+        Some(allowed) => allowed,
+        None => {
+            let filename = code
+                .getattr("co_filename")
+                .and_then(|f| f.extract::<String>())
+                .unwrap_or_else(|_| "<unknown>".to_string());
+            let func_name = code
+                .getattr("co_name")
+                .and_then(|n| n.extract::<String>())
+                .unwrap_or_else(|_| "<unknown>".to_string());
+            resolve_code_filter(code_ptr, &filename, &func_name)
+        }
+    };
+
+    if !trace_allowed {
+        return;
+    }
+
     let ts = if is_perfetto_enabled() { get_ts() } else { 0 };
     enqueue_event(TraceEvent::PyReturn {
-        code_ptr: code.as_ptr() as usize,
+        code_ptr,
         ts,
         tsc: crate::state::read_tsc(),
     });
 }
 
 #[pyfunction]
-#[pyo3(signature = (mode="precise", perfetto=true, deinstrument_threshold=500))]
+#[pyo3(signature = (mode="precise", perfetto=true, deinstrument_threshold=500, exclude=None, include_only=None))]
 pub fn start_tracing(
     py: Python,
     mode: &str,
     perfetto: bool,
     deinstrument_threshold: u32,
+    exclude: Option<Vec<String>>,
+    include_only: Option<Vec<String>>,
 ) -> PyResult<()> {
     init_tsc_calibration();
     EVENT_QUEUE.get_or_init(|| ArrayQueue::new(10_000));
@@ -178,6 +347,8 @@ pub fn start_tracing(
     IS_PRECISE.store(is_precise, Ordering::Relaxed);
     DEINSTRUMENT_THRESHOLD.store(deinstrument_threshold, Ordering::Relaxed);
     set_perfetto_enabled(perfetto);
+    set_exclude_patterns(exclude.unwrap_or_default());
+    set_include_patterns(include_only.unwrap_or_default());
 
     let mode_label = if is_precise { "precise" } else { "adaptive" };
     println!("[Ocular] ------------------------------------------------");
@@ -326,5 +497,7 @@ pub fn stop_tracing(py: Python) -> PyResult<()> {
         }
     }
 
+    clear_exclude_patterns();
+    clear_include_patterns();
     Ok(())
 }
