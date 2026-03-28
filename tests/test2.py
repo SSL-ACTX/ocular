@@ -24,9 +24,9 @@ def heavy_computation(n):
     return total
 
 
-def run_one_cycle(enable_tracing: bool, threshold: int = 600) -> tuple[float, int]:
+def run_one_cycle(enable_tracing: bool, threshold: int = 500) -> tuple[float, int]:
     if enable_tracing:
-        ocular.start_tracing(mode="precise", deinstrument_threshold=threshold)
+        ocular.start_tracing(mode="adaptive", deinstrument_threshold=threshold)
 
     # warmup
     _ = heavy_computation(1000)

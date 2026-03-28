@@ -33,11 +33,20 @@ pub enum TraceEvent {
     },
 }
 
+#[derive(Clone)]
+pub struct InstMeta {
+    pub opname: String,
+    pub arg: Option<i32>,
+    pub argrepr: Option<String>,
+    pub starts_line: Option<i32>,
+    pub is_jump_target: bool,
+}
+
 /// Structure to hold cached offline metadata for a given PyCode object.
 pub struct CodeMeta {
     pub name: String,
     pub code_obj: Py<PyCode>,
-    pub base_opcodes: HashMap<i32, String>,
+    pub base_opcodes: HashMap<i32, InstMeta>,
     pub valid_offsets: Vec<i32>, // Used to filter out inline caches
     pub filename: String,
     pub firstlineno: i32,
@@ -52,8 +61,9 @@ pub struct TraceStats {
 #[cfg(feature = "perfetto")]
 use serde::Serialize;
 
-#[cfg(feature = "perfetto")]
-#[derive(Serialize)]
+#[allow(dead_code)]
+#[derive(Debug)]
+#[cfg_attr(feature = "perfetto", derive(Serialize))]
 pub struct PerfettoEvent {
     pub name: String,
     pub cat: String,
@@ -61,6 +71,6 @@ pub struct PerfettoEvent {
     pub ts: u64,
     pub pid: u32,
     pub tid: u32,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "perfetto", serde(skip_serializing_if = "Option::is_none"))]
     pub args: Option<HashMap<String, String>>,
 }

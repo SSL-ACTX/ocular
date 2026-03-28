@@ -16,7 +16,7 @@ use std::thread;
 
 const BATCH_SIZE: usize = 1024;
 
-static DISABLE_OBJ: OnceLock<PyObject> = OnceLock::new();
+static DISABLE_OBJ: OnceLock<Py<PyAny>> = OnceLock::new();
 
 thread_local! {
     static LOCAL_BATCH: RefCell<Vec<TraceEvent>> = RefCell::new(Vec::with_capacity(BATCH_SIZE));
@@ -50,7 +50,7 @@ pub fn instruction_callback(
     py: Python<'_>,
     code: &Bound<'_, PyAny>,
     instruction_offset: i32,
-) -> PyObject {
+) -> Py<PyAny> {
     let code_ptr = code.as_ptr() as usize;
     enqueue_event(TraceEvent::Instruction {
         code_ptr,
@@ -75,7 +75,7 @@ pub fn instruction_callback(
             return disable_obj.clone_ref(py);
         }
     }
-    py.None()
+    py.None().into()
 }
 
 #[pyfunction]
@@ -108,7 +108,7 @@ pub fn jump_callback(
     code: &Bound<'_, PyAny>,
     instruction_offset: i32,
     destination_offset: i32,
-) -> PyObject {
+) -> Py<PyAny> {
     let ts = if is_perfetto_enabled() { get_ts() } else { 0 };
     let code_ptr = code.as_ptr() as usize;
     enqueue_event(TraceEvent::Jump {
@@ -136,7 +136,7 @@ pub fn jump_callback(
             return disable_obj.clone_ref(py);
         }
     }
-    py.None()
+    py.None().into()
 }
 
 #[pyfunction]
@@ -178,6 +178,14 @@ pub fn start_tracing(
     IS_PRECISE.store(is_precise, Ordering::Relaxed);
     DEINSTRUMENT_THRESHOLD.store(deinstrument_threshold, Ordering::Relaxed);
     set_perfetto_enabled(perfetto);
+
+    let mode_label = if is_precise { "precise" } else { "adaptive" };
+    println!("[Ocular] ------------------------------------------------");
+    println!("[Ocular] Starting Ocular tracing");
+    println!("[Ocular] mode = {}", mode_label);
+    println!("[Ocular] perfetto = {}", perfetto);
+    println!("[Ocular] deinstrument_threshold = {}", deinstrument_threshold);
+    println!("[Ocular] ------------------------------------------------");
 
     if !IS_RUNNING.swap(true, Ordering::Relaxed) {
         let handle = thread::spawn(telemetry_worker);
@@ -311,7 +319,7 @@ pub fn stop_tracing(py: Python) -> PyResult<()> {
     if IS_RUNNING.swap(false, Ordering::Relaxed) {
         if let Ok(mut thread_guard) = WORKER_THREAD.lock() {
             if let Some(handle) = thread_guard.take() {
-                py.allow_threads(|| {
+                Python::detach(py, || {
                     let _ = handle.join();
                 });
             }

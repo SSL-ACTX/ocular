@@ -1,11 +1,7 @@
 // state.rs
 use crate::model::TraceEvent;
 use crossbeam_queue::ArrayQueue;
-#[cfg(not(feature = "perfetto"))]
-use std::sync::atomic::AtomicBool;
-use std::sync::atomic::AtomicU32;
-#[cfg(feature = "perfetto")]
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::thread;
 use std::time::Instant;
@@ -22,31 +18,15 @@ pub static START_TSC: OnceLock<u64> = OnceLock::new();
 
 pub static DEINSTRUMENT_THRESHOLD: AtomicU32 = AtomicU32::new(500);
 
-#[cfg(feature = "perfetto")]
-pub static IS_PERFETTO_ENABLED: AtomicBool = AtomicBool::new(true);
+pub static IS_PERFETTO_ENABLED: AtomicBool = AtomicBool::new(false);
 
 #[allow(dead_code)]
 pub fn is_perfetto_enabled() -> bool {
-    #[cfg(feature = "perfetto")]
-    {
-        IS_PERFETTO_ENABLED.load(Ordering::Relaxed)
-    }
-
-    #[cfg(not(feature = "perfetto"))]
-    {
-        false
-    }
+    IS_PERFETTO_ENABLED.load(Ordering::Relaxed)
 }
 
 pub fn set_perfetto_enabled(enabled: bool) {
-    #[cfg(feature = "perfetto")]
-    {
-        IS_PERFETTO_ENABLED.store(enabled, Ordering::Relaxed);
-    }
-    #[cfg(not(feature = "perfetto"))]
-    {
-        let _ = enabled;
-    }
+    IS_PERFETTO_ENABLED.store(enabled, Ordering::Relaxed);
 }
 
 /// Reads the hardware Time Stamp Counter (TSC) for ultra-low-overhead cycle timing.
@@ -65,6 +45,25 @@ pub fn read_tsc() -> u64 {
     #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
     {
         0
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn perfetto_is_disabled_by_default() {
+        set_perfetto_enabled(false);
+        assert_eq!(is_perfetto_enabled(), false);
+    }
+
+    #[test]
+    fn perfetto_toggle_on_off() {
+        set_perfetto_enabled(true);
+        assert_eq!(is_perfetto_enabled(), true);
+        set_perfetto_enabled(false);
+        assert_eq!(is_perfetto_enabled(), false);
     }
 }
 

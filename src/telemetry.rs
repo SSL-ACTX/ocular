@@ -1,10 +1,6 @@
 // telemetry.rs
-#[cfg(feature = "perfetto")]
-use crate::model::PerfettoEvent;
-use crate::model::{CodeMeta, TraceEvent, TraceStats};
-#[cfg(feature = "perfetto")]
-use crate::state::is_perfetto_enabled;
-use crate::state::{EVENT_QUEUE, FREE_QUEUE, IS_PRECISE, IS_RUNNING};
+use crate::model::{CodeMeta, PerfettoEvent, TraceEvent, TraceStats};
+use crate::state::{EVENT_QUEUE, FREE_QUEUE, IS_PRECISE, IS_RUNNING, DEINSTRUMENT_THRESHOLD, is_perfetto_enabled};
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
 
@@ -12,6 +8,7 @@ const HOT_TRACE_EXPORT: bool = false;
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::{BufWriter, Write};
+use std::sync::atomic::Ordering;
 use std::thread;
 use std::time::Duration;
 
@@ -29,7 +26,6 @@ pub fn telemetry_worker() {
     let mut current_trace_cycles: u64 = 0;
 
     let mut hot_traces: HashMap<Vec<(usize, i32)>, TraceStats> = HashMap::new();
-    #[cfg(feature = "perfetto")]
     let mut perfetto_events: Vec<PerfettoEvent> = Vec::with_capacity(10_000);
 
     while IS_RUNNING.load(std::sync::atomic::Ordering::Relaxed) || !queue.is_empty() {
@@ -50,7 +46,7 @@ pub fn telemetry_worker() {
 
                         if let Some(code_obj) = code {
                             if !code_registry.contains_key(&code_ptr) {
-                                Python::with_gil(|py| {
+                                Python::attach(|py| {
                                     let bound_code = code_obj.bind(py);
 
                                     let func_name = bound_code
@@ -81,10 +77,37 @@ pub fn telemetry_worker() {
                                                             inst.getattr("opname").ok().and_then(
                                                                 |o| o.extract::<String>().ok(),
                                                             );
+                                                        let arg = inst
+                                                            .getattr("arg")
+                                                            .ok()
+                                                            .and_then(|o| o.extract::<i32>().ok());
+                                                        let argrepr =
+                                                            inst.getattr("argrepr").ok().and_then(
+                                                                |o| o.extract::<String>().ok(),
+                                                            );
+                                                        let starts_line = inst
+                                                            .getattr("starts_line")
+                                                            .ok()
+                                                            .and_then(|o| o.extract::<i32>().ok());
+                                                        let is_jump_target = inst
+                                                            .getattr("is_jump_target")
+                                                            .ok()
+                                                            .and_then(|o| o.extract::<bool>().ok())
+                                                            .unwrap_or(false);
+
                                                         if let (Some(off), Some(name)) =
                                                             (offset, opname)
                                                         {
-                                                            base_opcodes.insert(off, name);
+                                                            base_opcodes.insert(
+                                                                off,
+                                                                crate::model::InstMeta {
+                                                                    opname: name,
+                                                                    arg,
+                                                                    argrepr,
+                                                                    starts_line,
+                                                                    is_jump_target,
+                                                                },
+                                                            );
                                                             valid_offsets.push(off);
                                                         }
                                                     }
@@ -120,7 +143,6 @@ pub fn telemetry_worker() {
 
                         call_stack.push((code_ptr, lasti, tsc));
 
-                        #[cfg(feature = "perfetto")]
                         if is_perfetto_enabled() {
                             let name = code_registry
                                 .get(&code_ptr)
@@ -191,7 +213,6 @@ pub fn telemetry_worker() {
                                         });
                                     stats.hits += 1;
 
-                                    #[cfg(feature = "perfetto")]
                                     let mut total_trace_cycles: u64 = 0;
 
                                     if !is_precise {
@@ -202,8 +223,7 @@ pub fn telemetry_worker() {
                                         };
                                         for i in 0..len {
                                             stats.cycles[i] += avg;
-                                            #[cfg(feature = "perfetto")]
-                                            {
+                                            if is_perfetto_enabled() {
                                                 total_trace_cycles += avg;
                                             }
                                         }
@@ -217,8 +237,7 @@ pub fn telemetry_worker() {
                                             };
                                             let delta = next_tsc.saturating_sub(current_tsc);
                                             stats.cycles[i] += delta;
-                                            #[cfg(feature = "perfetto")]
-                                            {
+                                            if is_perfetto_enabled() {
                                                 total_trace_cycles += delta;
                                             }
                                         }
@@ -226,7 +245,6 @@ pub fn telemetry_worker() {
 
                                     *code_hot_hits.entry(code_ptr).or_insert(0) += 1;
 
-                                    #[cfg(feature = "perfetto")]
                                     if is_perfetto_enabled() {
                                         let name = code_registry
                                             .get(&code_ptr)
@@ -285,7 +303,6 @@ pub fn telemetry_worker() {
                         current_trace.clear();
                         current_trace_cycles = 0;
 
-                        #[cfg(feature = "perfetto")]
                         if is_perfetto_enabled() {
                             let name = code_registry
                                 .get(&code_ptr)
@@ -321,15 +338,38 @@ pub fn telemetry_worker() {
         processed_events
     );
 
-    #[cfg(feature = "perfetto")]
     if is_perfetto_enabled() {
-        if let Ok(file) = File::create("ocular_trace.json") {
-            let writer = BufWriter::new(file);
-            if serde_json::to_writer(writer, &perfetto_events).is_ok() {
-                println!("[Ocular] 🗄️ Perfetto timeline exported to 'ocular_trace.json'");
+        #[cfg(feature = "perfetto")]
+        {
+            if let Ok(file) = File::create("ocular_trace.json") {
+                let writer = BufWriter::new(file);
+                if serde_json::to_writer(writer, &perfetto_events).is_ok() {
+                    println!("[Ocular] 🗄️ Perfetto timeline exported to 'ocular_trace.json'");
+                }
             }
         }
+
+        #[cfg(not(feature = "perfetto"))]
+        {
+            println!("[Ocular] Perfetto tracing enabled at runtime, but crate built without perfetto feature; no JSON export.");
+        }
     }
+
+    let mode_label = if IS_PRECISE.load(Ordering::Relaxed) {
+        "precise"
+    } else {
+        "adaptive"
+    };
+    let perfetto_active = is_perfetto_enabled();
+    let deinstrument_threshold = DEINSTRUMENT_THRESHOLD.load(Ordering::Relaxed);
+
+    println!("[Ocular] =================================================");
+    println!("[Ocular] 🧭 Ocular Telemetry UI");
+    println!("[Ocular] mode                 = {}", mode_label);
+    println!("[Ocular] perfetto             = {}", perfetto_active);
+    println!("[Ocular] deinstrument_threshold = {}", deinstrument_threshold);
+    println!("[Ocular] active threads       = {:?}", thread::available_parallelism().ok());
+    println!("[Ocular] =================================================");
 
     if let Some((top_trace, stats)) = hot_traces.into_iter().max_by_key(|entry| entry.1.hits) {
         let user_codes: Vec<_> = code_hot_hits
@@ -368,24 +408,7 @@ pub fn telemetry_worker() {
         }
         println!("[Ocular] ------------------------------------------------");
         println!("[Ocular] 🎯 Top Hot Trace Detected:");
-        println!("[Ocular] Length: {} uOps", top_trace.len());
-
-        if !code_registry.is_empty() {
-            println!("[Ocular] 🔗 Code registry (code_ptr→function, file:line) [filtered]:");
-            let is_primary_code = |name: &str| {
-                !name.starts_with("_") && !name.contains("importlib") && !name.contains("sys")
-            };
-
-            for (&c_ptr, meta) in code_registry
-                .iter()
-                .filter(|(_, m)| is_primary_code(&m.name))
-            {
-                println!(
-                    "[Ocular]   0x{:x} -> {} ({}:{})",
-                    c_ptr, meta.name, meta.filename, meta.firstlineno
-                );
-            }
-        }
+        println!("[Ocular] Hot trace length : {} uOps", top_trace.len());
 
         if let Some((&c_ptr, &hits)) = code_hot_hits.iter().max_by_key(|entry| entry.1) {
             let func_name = code_registry
@@ -400,6 +423,8 @@ pub fn telemetry_worker() {
 
         println!("[Ocular] Hits:   {}", stats.hits);
         println!("[Ocular] Trace Disassembly with Hardware CPU Cycles (Base -> Specialized):");
+        println!("[Ocular]   #   code_ptr          line lbl instruction                             arg  repr           cycles");
+        println!("[Ocular] ------------------------------------------------");
 
         let mut trace_dump_lines = Vec::new();
         let is_precise = IS_PRECISE.load(std::sync::atomic::Ordering::Relaxed);
@@ -422,20 +447,43 @@ pub fn telemetry_worker() {
         trace_dump_lines.push(format!("Hits:   {}", stats.hits));
         trace_dump_lines.push(format!("------------------------------------------------"));
 
-        Python::with_gil(|py| {
+        let mut offset_to_label: HashMap<i32, String> = HashMap::new();
+        let mut label_counter = 1;
+
+        // Pre-compute jump labels for the UI
+        if let Some(&c_ptr) = selected_code.as_ref() {
+            if let Some(meta) = code_registry.get(&c_ptr) {
+                for &offset in &meta.valid_offsets {
+                    if let Some(inst) = meta.base_opcodes.get(&offset) {
+                        if inst.is_jump_target {
+                            offset_to_label.insert(offset, format!("L{}", label_counter));
+                            label_counter += 1;
+                        }
+                    }
+                }
+            }
+        }
+
+        let mut last_printed_line = -1;
+
+        Python::attach(|py| {
             let mut disassembly_cache: HashMap<usize, HashMap<i32, String>> = HashMap::new();
             let dis_module = py.import("dis").ok();
 
             for (idx, (c_ptr, lasti)) in top_trace.into_iter().enumerate() {
                 let mut opcode_base = "UNKNOWN".to_string();
                 let mut opcode_quickened = "UNKNOWN".to_string();
+                let mut arg_val = None;
+                let mut arg_repr = None;
+                let mut starts_line = None;
 
                 if let Some(meta) = code_registry.get(&c_ptr) {
-                    opcode_base = meta
-                        .base_opcodes
-                        .get(&lasti)
-                        .cloned()
-                        .unwrap_or_else(|| "UNKNOWN".to_string());
+                    if let Some(inst_meta) = meta.base_opcodes.get(&lasti) {
+                        opcode_base = inst_meta.opname.clone();
+                        arg_val = inst_meta.arg;
+                        arg_repr = inst_meta.argrepr.clone();
+                        starts_line = inst_meta.starts_line;
+                    }
 
                     let inst_map = disassembly_cache.entry(c_ptr).or_insert_with(|| {
                         let mut map = HashMap::new();
@@ -443,11 +491,24 @@ pub fn telemetry_worker() {
                             let kwargs = PyDict::new(py);
                             let _ = kwargs.set_item("adaptive", true);
 
-                            if let Ok(instructions) = dis.call_method(
+                            // Python 3.14+ safety catch for instrumented disassemblies
+                            let mut dis_result = dis.call_method(
                                 "get_instructions",
                                 (meta.code_obj.bind(py),),
                                 Some(&kwargs),
-                            ) {
+                            );
+
+                            if dis_result.is_err() {
+                                let fallback_kwargs = PyDict::new(py);
+                                let _ = fallback_kwargs.set_item("adaptive", false);
+                                dis_result = dis.call_method(
+                                    "get_instructions",
+                                    (meta.code_obj.bind(py),),
+                                    Some(&fallback_kwargs),
+                                );
+                            }
+
+                            if let Ok(instructions) = dis_result {
                                 if let Ok(iter) = instructions.try_iter() {
                                     for inst in iter {
                                         if let Ok(inst) = inst {
@@ -470,9 +531,11 @@ pub fn telemetry_worker() {
                         map
                     });
 
-                    if let Some(name) = inst_map.get(&lasti) {
-                        opcode_quickened = name.replace("INSTRUMENTED_", "");
-                    }
+                    opcode_quickened = inst_map
+                        .get(&lasti)
+                        .cloned()
+                        .map(|n| n.replace("INSTRUMENTED_", ""))
+                        .unwrap_or_else(|| opcode_base.clone());
                 }
 
                 let avg_cycles = stats.cycles[idx] / stats.hits;
@@ -482,16 +545,66 @@ pub fn telemetry_worker() {
                     format!("{} -> {}", opcode_base, opcode_quickened)
                 };
 
+                let line_prefix = if let Some(line) = starts_line {
+                    if line != last_printed_line {
+                        last_printed_line = line;
+                        format!("{:>3}", line)
+                    } else {
+                        "   ".to_string()
+                    }
+                } else {
+                    "   ".to_string()
+                };
+
+                let label_prefix = if let Some(label) = offset_to_label.get(&lasti) {
+                    format!("{:>3}:", label)
+                } else {
+                    "    ".to_string()
+                };
+
+                let arg_str = if let Some(arg) = arg_val {
+                    format!("{:<3}", arg)
+                } else {
+                    "   ".to_string()
+                };
+
+                // Transform "to 18" -> "to L2" for UI matching
+                let argrepr_str = if let Some(repr) = arg_repr {
+                    if repr.starts_with("to ") {
+                        if let Ok(target_offset) = repr[3..].parse::<i32>() {
+                            if let Some(lbl) = offset_to_label.get(&target_offset) {
+                                format!("(to {})", lbl)
+                            } else {
+                                format!("({})", repr)
+                            }
+                        } else {
+                            format!("({})", repr)
+                        }
+                    } else {
+                        format!("({})", repr)
+                    }
+                } else {
+                    "".to_string()
+                };
+
+                let opcode_line = format!(
+                    "{:>3} 0x{:016x}  {} {}  {:<40} {:<4} {:<15}",
+                    idx,
+                    c_ptr,
+                    line_prefix,
+                    label_prefix,
+                    transition,
+                    arg_str,
+                    argrepr_str
+                );
+
                 let line = if !is_precise {
                     format!(
-                        "  [{:03}] offset {:<3}: {:<45} | ~{} cycles (avg block latency)",
-                        idx, lasti, transition, avg_cycles
+                        "[Ocular] {} | ~{} cycles (avg block latency)",
+                        opcode_line, avg_cycles
                     )
                 } else {
-                    format!(
-                        "  [{:03}] offset {:<3}: {:<45} | ~{} cycles",
-                        idx, lasti, transition, avg_cycles
-                    )
+                    format!("[Ocular] {} | ~{} cycles", opcode_line, avg_cycles)
                 };
 
                 println!("{}", line);
